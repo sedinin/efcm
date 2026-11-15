@@ -30,29 +30,31 @@
 -define(HTTP_OPTS, [{timeout, 5000}]).
 -define(REQ_OPTS, [{full_result, false}, {body_format, binary}]).
 -define(TIMEOUT, 5000).
+-define(TOKEN_RETRY, 30000).
 
 %% new
 -define(FCM_HOST, "fcm.googleapis.com").
 -define(FCM_PORT, 443).
 
 
--type stream_data() :: #{reg_id := binary()
+-type stream_data() :: #{ reg_id := binary()
                         , message := term()
                         , from := {pid(), term()}
                         , stream := gun:stream_ref()
                         , timer := reference()
                         , status := non_neg_integer()
                         , headers := gun:req_headers()
-                        , body := binary()}.
+                        , body := binary()
+                        , retried := boolean() }.
 
--type state() :: #{service_file := binary() | string()
+-type state() :: #{ service_file := binary() | string()
                   , push_path := binary()
                   , auth_bearer := binary()
-                  , token_tref := reference()
+                  , token_tref := reference() | null
                   , gun_pid := pid()
                   , gun_mon := reference()
                   , streams := #{gun:stream_ref() := stream_data()}
-                  , max_streams := non_neg_integer()}.
+                  , max_streams := non_neg_integer() }.
 
 %% todo:
 %% 1. renew token (on 401 error)
@@ -105,128 +107,101 @@ format_status(State) ->
 %% functions is called when gen_statem receives and event from
 %% call/2, cast/2, or as a normal process message.
 open_connection(internal, _, State0 = #{}) ->
-    Opts = #{protocols => [http2]
+    Opts = #{ protocols => [http2]
             , http2_opts => http2_opts()
             , tls_opts => tls_opts()
-            , retry => 0},
+            , retry => 0 },
     {ok, GunPid} = gun:open(?FCM_HOST, ?FCM_PORT, Opts),
     GunMon = monitor(process, GunPid),
     %% got connection, now we have to reload access token
     State1 = reload_access_token(State0),
     %% initially one stream allowed
-    State2 = State1#{gun_pid => GunPid
+    State2 = State1#{ gun_pid => GunPid
                     , gun_mon => GunMon
                     , streams => #{}
-                    , max_streams => 1},
+                    , max_streams => 1 },
     {next_state, connected, State2}.
 
 
 -spec connected(_, _, state()) -> _.
-connected({call, From}, {push, RegId, Message}, State = #{}) ->
-    case send_push(From, RegId, Message, State) of
-        {error, {overload, TotalStreams, MaxStreams}} ->
-            {keep_state_and_data, {reply, From, {error, {overload, TotalStreams, MaxStreams}}}};
+connected({call, From}, {push, RegId, Message}, State0 = #{}) ->
+    case send_push(From, RegId, Message, false, State0) of
+        {error, Reason} ->
+            {keep_state_and_data, {reply, From, {error, Reason}}};
         {ok, State1} ->
             {keep_state, State1}
     end;
+connected(info, refresh_token, State0) ->
+    %% scheduled access token renewal
+    {keep_state, refresh_access_token(State0)};
 connected(info
          , {gun_response, GunPid, StreamRef, fin, 401, _Headers}
-         , #{gun_pid := GunPid, streams := Streams0} = State0) ->
+         , #{gun_pid := GunPid} = State0) ->
     %% got 401, refresh token then repeat request (send push)
-    %% 1. closing stream
     gun:cancel(GunPid, StreamRef),
-    %% 2. refreshing token
-    State1 = reload_access_token(State0),
-    %% get stream data, vars from it and remove it from map
-    #{StreamRef := StreamData} = Streams0,
-    #{from := From, reg_id := RegId, message := Message} = StreamData,
-    Streams1 = maps:remove(StreamRef, Streams0),
-    State2 = State1#{streams => Streams1},
-    case send_push(From, RegId, Message, State2) of
-        {error, {overload, TotalStreams, MaxStreams}} ->
-            {keep_state_and_data, {reply, From, {error, {overload, TotalStreams, MaxStreams}}}};
-        {ok, State2} ->
-            {keep_state, State2}
+    case take_stream(StreamRef, State0) of
+        {StreamData, State1} -> retry_unauthorized(StreamData, State1);
+        error -> {keep_state, State0}
     end;
 connected(info
          , {gun_response, GunPid, StreamRef, fin, Status, Headers}
          , #{gun_pid := GunPid} = State0) ->
     %% got final response without body
     lager:debug("final response without body, status: ~B, headers: ~p", [Status, Headers]),
-    #{streams := Streams0} = State0,
-    #{StreamRef := StreamData} = Streams0,
-    #{from := From} = StreamData,
-    Streams1 = maps:remove(StreamRef, Streams0),
     gun:cancel(GunPid, StreamRef), %% final response, closing stream
-    gen_statem:reply(From, {Status, Headers, no_body}),
-    {keep_state, State0#{streams => Streams1}};
+    case take_stream(StreamRef, State0) of
+        {#{from := From}, State1} ->
+            gen_statem:reply(From, {Status, Headers, no_body}),
+            {keep_state, State1};
+        error ->
+            {keep_state, State0}
+    end;
 connected(info
          , {gun_response, GunPid, StreamRef, nofin, Status, Headers}
          , #{gun_pid := GunPid} = State0) ->
     %% non-final response without body
     lager:debug("non-final response without body, status: ~B, headers: ~p", [Status, Headers]),
-    #{streams := Streams0} = State0,
-    #{StreamRef := StreamState0} = Streams0,
-    StreamState1 = StreamState0#{status => Status, headers => Headers},
-    Streams1 = Streams0#{StreamRef => StreamState1},
-    {keep_state, State0#{streams := Streams1}};
+    {keep_state, update_stream(StreamRef,
+                               fun(SD) -> SD#{status => Status, headers => Headers} end,
+                               State0)};
 connected(info
          , {gun_data, GunPid, StreamRef, fin, Data}
          , #{gun_pid := GunPid} = State0) ->
     %% got data, finally
-    #{streams := Streams0} = State0,
-    #{StreamRef := StreamData} = Streams0,
-    lager:debug("final data response, data: ~p, stream data: ~p", [Data, StreamData]),
-    #{from := From, status := Status, body := B0, reg_id := PushId} = StreamData,
-    FullBody = <<B0/binary, Data/binary>>,
-    %% xxx: should we process 401 (refresh token) status here?
-    case Status of
-        200 ->
-            %% response is 'ok', parsing json body and return result id
-            #{name := Name} = jsx:decode(FullBody, ?JSX_OPTS),
-            MsgId = lists:last(binary:split(Name, <<"/">>, [global, trim_all])),
-            gen_statem:reply(From, {ok, MsgId});
-        404 ->
-            %% wrong (expired?) push id, specific error
-            lager:debug("push id not found: ~s", [PushId]),
-            gen_statem:reply(From, {error, wrong_push_id});
-        _ ->
-            %% unknown status, replying with error
-            lager:debug("unknown error: ~B : ~p", [Status, FullBody]),
-            gen_statem:reply(From, {error, {Status, FullBody}})
-    end,
-    Streams1 = maps:remove(StreamRef, Streams0),
-    %% do not close stream, debug
-    %% gun:cancel(GunPid, StreamRef), %% final, closing stream
-    {keep_state, State0#{streams => Streams1}};
+    case take_stream(StreamRef, State0) of
+        {#{status := 401} = StreamData, State1} ->
+            retry_unauthorized(StreamData, State1);
+        {StreamData, State1} ->
+            lager:debug("final data response, data: ~p, stream data: ~p", [Data, StreamData]),
+            #{from := From, status := Status, body := B0, reg_id := PushId} = StreamData,
+            gen_statem:reply(From, data_reply(Status, <<B0/binary, Data/binary>>, PushId)),
+            {keep_state, State1};
+        error ->
+            %% stream already answered (timeout?), ignoring
+            {keep_state, State0}
+    end;
 connected(info
          , {gun_data, GunPid, StreamRef, nofin, Data}
          , #{gun_pid := GunPid} = State0) ->
     %% add data to buffer, still waiting
-    #{streams := Streams0} = State0,
-    #{StreamRef := StreamState0} = Streams0,
-    lager:debug("non-final data response, data: ~p, stream data: ~p", [Data, StreamState0]),
-    #{body := B0} = StreamState0,
-    StreamState1 = StreamState0#{body => <<B0/binary, Data/binary>>},
-    Streams1 = Streams0#{StreamRef => StreamState1},
-    {keep_state, State0#{streams => Streams1}};
+    lager:debug("non-final data response, data: ~p", [Data]),
+    {keep_state, update_stream(StreamRef,
+                               fun(#{body := B0} = SD) -> SD#{body => <<B0/binary, Data/binary>>} end,
+                               State0)};
 connected(info
          , {gun_error, GunPid, StreamRef, Reason}
          , #{gun_pid := GunPid} = State0) ->
     %% answering with error, remove entry
-    #{streams := Streams0} = State0,
-    case maps:get(StreamRef, Streams0, null) of
-        null ->
-            lager:debug("stream error received, error: ~p, no stream data", [Reason]),
-            %% nothing to do
-            {keep_state, State0};
-        StreamData ->
+    case take_stream(StreamRef, State0) of
+        {StreamData, State1} ->
             lager:debug("stream error received, error: ~p, stream data: ~p", [Reason, StreamData]),
             #{from := From} = StreamData,
             gen_statem:reply(From, {error, Reason}),
-            Streams1 = maps:remove(StreamRef, Streams0),
             gun:cancel(GunPid, StreamRef),
-            {keep_state, State0#{streams => Streams1}}
+            {keep_state, State1};
+        error ->
+            lager:debug("stream error received, error: ~p, no stream data", [Reason]),
+            {keep_state, State0}
     end;
 connected(info
          , {gun_error, GunPid, Reason}
@@ -240,20 +215,16 @@ connected(info
 connected(info
          , {timeout, GunPid, StreamRef}
          , #{gun_pid := GunPid} = State0) ->
-    #{streams := Streams0} = State0,
     %% gun pid matches, we have to answer {error, timeout}
-    case maps:find(StreamRef, Streams0) of
-        {ok, StreamData} ->
+    case take_stream(StreamRef, State0) of
+        {StreamData, State1} ->
             lager:debug("timeout signalled on stream: ~p", [StreamData]),
             #{from := From} = StreamData,
             gen_statem:reply(From, {error, timeout}),
-            Streams1 = maps:remove(StreamRef, Streams0),
             gun:cancel(GunPid, StreamRef),
-            {keep_state, State0#{gun_streams => Streams1}};
+            {keep_state, State1};
         error ->
-            %% cant find stream data by stream ref?
-            %% may be just answered and removed,
-            %% ignoring
+            %% may be just answered and removed, ignoring
             {keep_state, State0}
     end;
 connected(info,
@@ -309,7 +280,7 @@ handle_common(info
     lager:debug("gun process ~p died with reason: ~p", [GunPid, Reason]),
     #{streams := Streams} = State0,
     spawn(efcm_conn, reply_errors_and_cancel_timers, [Streams, Reason]),
-    {next_state, down, State0#{gun_streams => #{}},
+    {next_state, down, State0#{streams => #{}, max_streams => 1},
      {next_event, internal, {down, StateName, Reason}}};
 handle_common(state_timeout
              , EventContent
@@ -369,34 +340,90 @@ push(GunPid, AuthKey, PushPath, RegId, Message0) ->
     Headers = http_headers(AuthKey),
     gun:post(GunPid, PushPath, Headers, Body).
 
--spec send_push({pid(), term()}, binary(), term(), map()) -> map().
-send_push(From, RegId, Message, State) ->
+-spec send_push({pid(), term()}, binary(), term(), boolean(), state()) ->
+          {ok, state()} | {error, {overload, non_neg_integer(), non_neg_integer()}}.
+send_push(From, RegId, Message, Retried, State) ->
     #{gun_pid := GunPid
      , push_path := PushPath
      , auth_bearer := AuthBearer
      , streams := Streams0
      , max_streams := MaxStreams} = State,
     TotalStreams = maps:size(Streams0),
-    StreamAllowed = stream_allowed(TotalStreams, MaxStreams),
-    if
-        not StreamAllowed ->
+    case stream_allowed(TotalStreams, MaxStreams) of
+        false ->
             lager:debug("no more streams allowed, current: ~p, max: ~p", [TotalStreams, MaxStreams]),
             {error, {overload, TotalStreams, MaxStreams}};
-        {keep_state_and_data, {reply, From, {error, {overload, TotalStreams, MaxStreams}}}};
         true ->
             StreamRef = push(GunPid, AuthBearer, PushPath, RegId, Message),
             Tmr = erlang:send_after(?TIMEOUT, self(), {timeout, GunPid, StreamRef}),
-            StreamData = #{reg_id => RegId
+            StreamData = #{ reg_id => RegId
                           , message => Message
                           , from => From
                           , stream => StreamRef
                           , timer => Tmr
                           , status => 200 %% b4 we know real status
                           , headers => []
-                          , body => <<>>},
+                          , body => <<>>
+                          , retried => Retried },
             Streams1 = Streams0#{StreamRef => StreamData},
             {ok, State#{streams => Streams1}}
     end.
+
+
+%% removes stream data from state and cancels its timeout timer
+-spec take_stream(gun:stream_ref(), state()) -> {stream_data(), state()} | error.
+take_stream(StreamRef, #{streams := Streams0} = State) ->
+    case maps:take(StreamRef, Streams0) of
+        {#{timer := Tmr} = StreamData, Streams1} ->
+            erlang:cancel_timer(Tmr),
+            {StreamData, State#{streams => Streams1}};
+        error ->
+            error
+    end.
+
+
+%% applies F to stream data, if stream is still known
+-spec update_stream(gun:stream_ref(), fun((stream_data()) -> stream_data()), state()) -> state().
+update_stream(StreamRef, F, #{streams := Streams0} = State) ->
+    case maps:find(StreamRef, Streams0) of
+        {ok, StreamData} -> State#{streams => Streams0#{StreamRef => F(StreamData)}};
+        error -> State
+    end.
+
+
+%% got 401: refresh token and resend push once
+retry_unauthorized(#{retried := true, from := From}, State) ->
+    gen_statem:reply(From, {error, unauthorized}),
+    {keep_state, State};
+retry_unauthorized(#{from := From, reg_id := RegId, message := Message}, State0) ->
+    State1 = refresh_access_token(State0),
+    case send_push(From, RegId, Message, true, State1) of
+        {error, Reason} ->
+            gen_statem:reply(From, {error, Reason}),
+            {keep_state, State1};
+        {ok, State2} ->
+            {keep_state, State2}
+    end.
+
+
+data_reply(200, Body, _PushId) ->
+    %% response is 'ok', parsing json body and return result id
+    try jsx:decode(Body, ?JSX_OPTS) of
+        #{name := Name} ->
+            {ok, lists:last(binary:split(Name, <<"/">>, [global, trim_all]))};
+        _ ->
+            {error, {bad_response, Body}}
+    catch _:_ ->
+            {error, {bad_response, Body}}
+    end;
+data_reply(404, _Body, PushId) ->
+    %% wrong (expired?) push id, specific error
+    lager:debug("push id not found: ~s", [PushId]),
+    {error, wrong_push_id};
+data_reply(Status, Body, _PushId) ->
+    %% unknown status, replying with error
+    lager:debug("unknown error: ~B : ~p", [Status, Body]),
+    {error, {Status, Body}}.
 
 
 -spec(make_fcm_push_path(binary()) -> binary()).
@@ -419,6 +446,17 @@ reload_access_token(#{service_file := ServiceFile} = State0) ->
            }.
 
 
+%% like reload_access_token/1, but keeps old token and retries later on failure
+refresh_access_token(State0) ->
+    try
+        reload_access_token(State0)
+    catch C:E ->
+            lager:warning("FCM access token refresh failed: ~p:~p, retry in ~B ms",
+                          [C, E, ?TOKEN_RETRY]),
+            State0#{token_tref => erlang:send_after(?TOKEN_RETRY, self(), refresh_token)}
+    end.
+
+
 cancel_timer(#{token_tref := null}) ->
     ok;
 cancel_timer(#{token_tref := TimerRef}) ->
@@ -433,7 +471,11 @@ http_headers(AuthKey) ->
 http2_opts() -> #{notify_settings_changed => true}.
 
 
-tls_opts() -> [{verify, verify_none}].
+tls_opts() ->
+    [{verify, verify_peer}
+    , {cacerts, public_key:cacerts_get()}
+    , {customize_hostname_check,
+       [{match_fun, public_key:pkix_verify_hostname_match_fun(https)}]}].
 
 
 -spec(stream_allowed(StreamsCount :: non_neg_integer(),
