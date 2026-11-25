@@ -29,7 +29,9 @@
 -define(JSX_OPTS, [return_maps, {labels, atom}]).
 -define(HTTP_OPTS, [{timeout, 5000}]).
 -define(REQ_OPTS, [{full_result, false}, {body_format, binary}]).
--define(TIMEOUT, 5000).
+%% timeout is 10 seconds as recommended:
+%% https://firebase.google.com/docs/cloud-messaging/scale-fcm
+-define(TIMEOUT, 10000).
 -define(TOKEN_RETRY, 30000).
 
 %% new
